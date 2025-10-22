@@ -1,0 +1,549 @@
+import json
+import os
+import numpy as np
+import re
+import math
+import csv
+from urllib.parse import urlparse
+import tkinter as tk
+from tkinter import ttk, messagebox, scrolledtext, filedialog
+
+# ----------------------------
+# Конфигурация по умолчанию
+# ----------------------------
+DEFAULT_SUSPICIOUS_FILE = "suspicious_words.json"
+
+# ----------------------------
+# Работа с suspicious_words.json
+# ----------------------------
+def create_default_suspicious_file(path=DEFAULT_SUSPICIOUS_FILE):
+    default = {
+        "secure": 1.0,
+        "login": 0.9,
+        "verify": 0.8,
+        "bank": 1.2,
+        "account": 1.0,
+        "update": 0.7,
+        "confirm": 0.6,
+        "paypal": 1.5
+    }
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(default, f, ensure_ascii=False, indent=2)
+    return default
+
+def load_suspicious_words(path=DEFAULT_SUSPICIOUS_FILE):
+    if not os.path.exists(path):
+        words = create_default_suspicious_file(path)
+        return words
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            if not isinstance(data, dict):
+                raise ValueError("Файл должен содержать объект (словарь).")
+            cleaned = {}
+            for k, v in data.items():
+                if not isinstance(k, str):
+                    continue
+                try:
+                    wt = float(v)
+                except Exception:
+                    wt = 1.0
+                cleaned[k.lower()] = wt
+            return cleaned
+    except Exception as e:
+        messagebox.showwarning("Warning", f"Не удалось загрузить {path}: {e}\nСоздан файл с примерами.")
+        words = create_default_suspicious_file(path)
+        return words
+
+# ----------------------------
+# Извлечение признаков
+# ----------------------------
+def extract_features(url, suspicious_dict):
+    """
+    Возвращает признаки:
+    [length, num_digits, num_hyphens, num_dots, suspicious_score, entropy, mixed_alphabet_suspicion]
+    """
+    parsed = urlparse(url)
+    domain = parsed.netloc if parsed.netloc else parsed.path
+    domain = domain.strip().lower()
+    domain = domain.split(':')[0]
+
+    length = len(domain)
+    num_digits = sum(c.isdigit() for c in domain)
+    num_hyphens = domain.count('-')
+    num_dots = domain.count('.')
+
+    suspicious_score = 0.0
+    for word, weight in suspicious_dict.items():
+        if word and word in domain:
+            suspicious_score += float(weight)
+
+    def calculate_entropy(s):
+        if len(s) == 0:
+            return 0.0
+        prob = [float(s.count(c)) / len(s) for c in dict.fromkeys(list(s))]
+        return -sum([p * math.log(p, 2) for p in prob])
+    entropy = calculate_entropy(domain)
+
+    mixed_alphabet_suspicion = 0.0
+    # более продвинутый анализ смешения алфавитов
+    if re.search(r'[а-яА-Я]', domain) and re.search(r'[a-zA-Z]', domain):
+        mixed_alphabet_suspicion = 0.7
+    elif num_digits > 3:
+        mixed_alphabet_suspicion = 0.5
+
+    # нормализуем признаки (простая нормализация: длина / 100, цифры/10 и т.п.)
+    # (не обязательно, но помогает при обучении)
+    return [
+        float(length) / 100.0,
+        float(num_digits) / 10.0,
+        float(num_hyphens) / 10.0,
+        float(num_dots) / 10.0,
+        round(suspicious_score / 5.0, 4),  # масштабируем вес
+        round(entropy / 10.0, 4),
+        round(mixed_alphabet_suspicion, 4)
+    ]
+
+# ----------------------------
+# Этап 1: Создание индивидов (популяция)
+# ----------------------------
+def create_individual(n_features, hidden_layers, output_neurons):
+    layers = [n_features] + hidden_layers + [output_neurons]
+    weights = []
+    for i in range(len(layers) - 1):
+        # Инициализация маленькими значениями
+        w = np.random.uniform(-0.5, 0.5, size=(layers[i], layers[i + 1]))
+        weights.append(w)
+    return weights
+
+# ----------------------------
+# Нейросетевые утилиты (forward/backprop)
+# ----------------------------
+def sigmoid(x):
+    return 1.0 / (1.0 + np.exp(-x))
+
+def sigmoid_deriv(y):
+    return y * (1.0 - y)  # y = sigmoid(x)
+
+def tanh_deriv(y):
+    return 1.0 - np.square(y)  # y = tanh(x)
+
+def forward_store_activations(features, weights):
+    """
+    Прямой проход, возвращает список активаций и входов (pre-activation)
+    activations: [a0 (input), a1, a2, ..., output]
+    zs: pre-activation values for each layer (для backprop)
+    """
+    a = np.array(features, dtype=float)
+    activations = [a]
+    zs = []
+    for i, w in enumerate(weights):
+        z = np.dot(a, w)  # shape (next_layer,)
+        zs.append(z)
+        if i < len(weights) - 1:
+            a = np.tanh(z)  # скрытые
+        else:
+            a = sigmoid(z)  # выход
+        activations.append(a)
+    return activations, zs
+
+def forward_predict(features, weights):
+    a = np.array(features, dtype=float)
+    for i, w in enumerate(weights):
+        z = np.dot(a, w)
+        if i < len(weights) - 1:
+            a = np.tanh(z)
+        else:
+            a = sigmoid(z)
+    # выход: если выход одномерный — вернуть скаляр
+    if np.isscalar(a):
+        return float(a)
+    return float(a.ravel()[0])
+
+# ----------------------------
+# Этап 2: Оценка и обучение (supervised)
+# ----------------------------
+def mse_loss(preds, targets):
+    preds = np.array(preds, dtype=float)
+    targets = np.array(targets, dtype=float)
+    return float(np.mean((preds - targets) ** 2))
+
+def evaluate_on_dataset(weights, X, y):
+    preds = [forward_predict(x, weights) for x in X]
+    loss = mse_loss(preds, y)
+    # порог 0.5 для метки
+    preds_label = [1 if p >= 0.5 else 0 for p in preds]
+    accuracy = float(np.mean(np.array(preds_label) == np.array(y)))
+    return loss, accuracy
+
+def train_individual(weights, X, y, lr=0.1, epochs=10, batch_size=16):
+    """
+    Простой батч-стохастический градиентный спуск с backprop.
+    weights — список numpy матриц (layers).
+    X — список/ndarray признаков (N x n_features)
+    y — список/ndarray меток (0/1)
+    Возвращает обновлённые веса.
+    """
+    num_samples = len(X)
+    for epoch in range(epochs):
+        # перемешиваем данные
+        idx = np.arange(num_samples)
+        np.random.shuffle(idx)
+        for start in range(0, num_samples, batch_size):
+            batch_idx = idx[start:start + batch_size]
+            # инициализация накопителей градиентов
+            grad_acc = [np.zeros_like(w) for w in weights]
+            for i in batch_idx:
+                xi = X[i]
+                yi = y[i]
+                activations, zs = forward_store_activations(xi, weights)
+                # вычисление ошибки выхода
+                output = activations[-1]  # shape (1,) или scalar
+                if np.isscalar(output):
+                    output = np.array([output])
+                error = output - yi  # shape (1,)
+                # dL/dz_last = error * sigmoid'
+                delta = error * sigmoid_deriv(output)  # shape (1,)
+                # backward through layers
+                # grad for last weights: a_{L-1}.T dot delta
+                a_prev = activations[-2].reshape(-1, 1)  # (n_prev, 1)
+                delta = delta.reshape(1, -1)  # (1, n_out)
+                grad_acc[-1] += np.dot(a_prev, delta)  # shape matches last weight
+
+                # propagate to previous layers
+                delta_prev = delta  # shape (1, n_k)
+                for l in range(len(weights) - 2, -1, -1):
+                    w_next = weights[l + 1]  # shape (n_l, n_{l+1})
+                    # delta for layer l: (w_next dot delta_prev.T).T * tanh'
+                    z_l = zs[l]
+                    a_l = activations[l + 1]  # after activation
+                    # compute (n_l,) vector
+                    back = np.dot(delta_prev, w_next.T).reshape(-1)  # shape (n_l,)
+                    # derivative of tanh on activation a_l
+                    deriv = tanh_deriv(a_l)
+                    delta_l = (back * deriv).reshape(1, -1)  # (1, n_l)
+                    a_prev = activations[l].reshape(-1, 1)  # (n_{l-1}, 1)
+                    grad_acc[l] += np.dot(a_prev, delta_l)  # accumulate
+
+                    delta_prev = delta_l
+
+            # После батча — обновляем веса
+            for j in range(len(weights)):
+                # средний градиент по батчу
+                weights[j] -= (lr / max(1, len(batch_idx))) * grad_acc[j]
+    return weights
+
+def train_population(population, X, y, lr=0.1, epochs=5, batch_size=16, progress_callback=None):
+    """
+    Обучает каждый индивид популяции на всей базе (supervised).
+    Возвращает обновлённую популяцию и метрики (loss, acc) для каждого до/после.
+    """
+    metrics = []
+    for idx, indiv in enumerate(population, start=1):
+        loss_before, acc_before = evaluate_on_dataset(indiv, X, y)
+        indiv = train_individual(indiv, X, y, lr=lr, epochs=epochs, batch_size=batch_size)
+        loss_after, acc_after = evaluate_on_dataset(indiv, X, y)
+        metrics.append({
+            "before": (loss_before, acc_before),
+            "after": (loss_after, acc_after)
+        })
+        if progress_callback:
+            progress_callback(idx, len(population))
+    return population, metrics
+
+# ----------------------------
+# Загрузка обучающей базы
+# ----------------------------
+def prepare_dataset_from_file(path, suspicious_dict):
+    rows = []
+    if not os.path.exists(path):
+        raise FileNotFoundError(path)
+    if path.lower().endswith(".csv"):
+        with open(path, "r", encoding="utf-8") as f:
+            reader = csv.reader(f)
+            header = next(reader, None)
+            # попытаемся определить есть ли header с 'url' и 'label'
+            has_header = False
+            if header:
+                cols = [c.strip().lower() for c in header]
+                if "url" in cols:
+                    has_header = True
+            if has_header:
+                f.seek(0)
+                reader = csv.DictReader(f)
+                for r in reader:
+                    url = r.get('url') or r.get('URL') or r.get('Url')
+                    lab = r.get('label') or r.get('Label') or r.get('LABEL')
+                    if not url:
+                        continue
+                    try:
+                        label = int(float(lab)) if lab is not None else 1
+                    except Exception:
+                        label = 1
+                    rows.append((url, 1 if label else 0))
+            else:
+                # простой CSV: каждая строка — url[,label]
+                # если есть второй столбец — попытаемся прочитать как метку
+                if header:
+                    # header содержал первую строку с URL (нет заголовка), сохраним её
+                    if header[0]:
+                        try:
+                            # попробуем понять, второй столбец есть?
+                            second = header[1] if len(header) > 1 else None
+                            if second is None:
+                                rows.append((header[0], 1))
+                            else:
+                                try:
+                                    lab = int(float(second))
+                                    rows.append((header[0], 1 if lab else 0))
+                                except Exception:
+                                    rows.append((header[0], 1))
+                        except Exception:
+                            pass
+                for line in reader:
+                    if not line:
+                        continue
+                    url = line[0]
+                    label = 1
+                    if len(line) > 1:
+                        try:
+                            label = int(float(line[1]))
+                        except Exception:
+                            label = 1
+                    rows.append((url, label))
+    else:
+        # JSON (простая поддержка)
+        with open(path, "r", encoding="utf-8") as f:
+            import json
+            data = json.load(f)
+            if isinstance(data, dict) and 'samples' in data and isinstance(data['samples'], list):
+                data = data['samples']
+            for item in data:
+                if isinstance(item, dict) and 'url' in item:
+                    label = int(item.get('label', 1))
+                    rows.append((item['url'], label))
+
+    if not rows:
+        raise ValueError("Не найдено допустимых URL в файле.")
+
+    X = [extract_features(url, suspicious_dict) for url, _ in rows]
+    y = [1 if label else 0 for _, label in rows]
+    return X, y
+
+# ----------------------------
+# GUI: интерфейс и действия
+# ----------------------------
+# глобальные состояния
+loaded_X = None
+loaded_y = None
+loaded_dataset_path = None
+current_population = None
+suspicious_dict_cache = None
+
+def browse_suspicious_file():
+    p = filedialog.askopenfilename(title="Выберите JSON файл со словами",
+                                   filetypes=[("JSON files", "*.json"), ("All files", "*.*")])
+    if p:
+        suspicious_entry.delete(0, tk.END)
+        suspicious_entry.insert(0, p)
+
+def load_dataset_action():
+    global loaded_X, loaded_y, loaded_dataset_path, suspicious_dict_cache
+    p = filedialog.askopenfilename(title="Выберите CSV/JSON с базой",
+                                   filetypes=[("CSV files", "*.csv"), ("JSON files", "*.json"), ("All files", "*.*")])
+    if not p:
+        return
+    suspicious_path = suspicious_entry.get().strip() or DEFAULT_SUSPICIOUS_FILE
+    suspicious_dict_cache = load_suspicious_words(suspicious_path)
+    try:
+        X, y = prepare_dataset_from_file(p, suspicious_dict_cache)
+    except Exception as e:
+        messagebox.showerror("Ошибка", f"Не удалось загрузить базу: {e}")
+        return
+    loaded_X = X
+    loaded_y = y
+    loaded_dataset_path = p
+    output_box.insert(tk.END, f"Загружена база: {p}\n")
+    output_box.insert(tk.END, f"Количество записей: {len(y)} (фишинг={sum(y)}, безопасно={len(y)-sum(y)})\n\n")
+
+def create_population_action():
+    global current_population
+    try:
+        population_size = int(pop_entry.get().strip())
+        if population_size <= 0:
+            raise ValueError
+    except Exception:
+        messagebox.showerror("Ошибка", "Введите корректное целое число для размера популяции!")
+        return
+
+    if loaded_X is None:
+        messagebox.showinfo("Инфо", "Желательно сначала загрузить обучающую базу, но можно и без неё.")
+    suspicious_path = suspicious_entry.get().strip() or DEFAULT_SUSPICIOUS_FILE
+    suspicious_dict = load_suspicious_words(suspicious_path)
+
+    # берём число признаков по extract_features
+    sample_feats = extract_features("example.com", suspicious_dict)
+    n_features = len(sample_feats)
+    hidden_layers = [10, 5]
+    output_neurons = 1
+
+    population = [create_individual(n_features, hidden_layers, output_neurons)
+                  for _ in range(population_size)]
+    current_population = population
+
+    output_box.insert(tk.END, f"Популяция создана: {population_size} индивидов\n")
+    output_box.insert(tk.END, "Можно запустить обучение на загруженной базе (если есть).\n\n")
+
+def train_population_action():
+    global current_population, loaded_X, loaded_y, suspicious_dict_cache
+    if current_population is None:
+        messagebox.showerror("Ошибка", "Сначала создайте популяцию.")
+        return
+    if loaded_X is None or loaded_y is None:
+        messagebox.showerror("Ошибка", "Сначала загрузите обучающую базу (CSV/JSON).")
+        return
+
+    # параметры обучения берём из полей UI или используем значения по умолчанию
+    try:
+        epochs = int(epochs_entry.get().strip())
+    except Exception:
+        epochs = 5
+    try:
+        lr = float(lr_entry.get().strip())
+    except Exception:
+        lr = 0.05
+    try:
+        batch_size = int(batch_entry.get().strip())
+    except Exception:
+        batch_size = 16
+
+    output_box.insert(tk.END, f"Обучение популяции: epochs={epochs}, lr={lr}, batch={batch_size}\n")
+    output_box.see(tk.END)
+
+    # метрики до обучения (для каждого индивида) — покажем среднее и лучший
+    before_losses = []
+    before_accs = []
+    for indiv in current_population:
+        loss_b, acc_b = evaluate_on_dataset(indiv, loaded_X, loaded_y)
+        before_losses.append(loss_b)
+        before_accs.append(acc_b)
+    output_box.insert(tk.END, f"Before  — avg loss: {np.mean(before_losses):.4f}, avg acc: {np.mean(before_accs):.4f}, best acc: {np.max(before_accs):.4f}\n")
+
+    # callback для прогресса
+    def progress_cb(i, total):
+        output_box.insert(tk.END, f"  Обучен индивид {i}/{total}\n")
+        output_box.see(tk.END)
+
+    # обучаем
+    current_population, metrics = train_population(current_population, loaded_X, loaded_y, lr=lr, epochs=epochs, batch_size=batch_size, progress_callback=progress_cb)
+
+    # метрики после
+    after_losses = [m['after'][0] for m in metrics]
+    after_accs = [m['after'][1] for m in metrics]
+    output_box.insert(tk.END, f"After   — avg loss: {np.mean(after_losses):.4f}, avg acc: {np.mean(after_accs):.4f}, best acc: {np.max(after_accs):.4f}\n\n")
+
+    # покажем лучший индивид
+    best_idx = int(np.argmax(after_accs))
+    best_indiv = current_population[best_idx]
+    loss_best, acc_best = evaluate_on_dataset(best_indiv, loaded_X, loaded_y)
+    output_box.insert(tk.END, f"🏆 Лучший индивид: #{best_idx+1} — loss: {loss_best:.4f}, acc: {acc_best:.4f}\n")
+    output_box.insert(tk.END, "Можно протестировать любой URL в поле и сравнить предсказание лучшего индивида.\n\n")
+
+def test_single_url_with_best():
+    global current_population, loaded_X, loaded_y
+    url = url_entry.get().strip()
+    if not url:
+        messagebox.showerror("Ошибка", "Введите ссылку для теста.")
+        return
+    if current_population is None:
+        messagebox.showerror("Ошибка", "Создайте и обучите популяцию.")
+        return
+    # если есть обученная популяция, найдём лучшего по текущей базе (если есть)
+    best = None
+    best_score = -1.0
+    if loaded_X is not None:
+        for indiv in current_population:
+            _, acc = evaluate_on_dataset(indiv, loaded_X, loaded_y)
+            if acc > best_score:
+                best_score = acc
+                best = indiv
+    else:
+        best = current_population[0]
+    suspicious_path = suspicious_entry.get().strip() or DEFAULT_SUSPICIOUS_FILE
+    suspicious_dict = load_suspicious_words(suspicious_path)
+    feats = extract_features(url, suspicious_dict)
+    pred = forward_predict(feats, best)
+    label = "фишинг" if pred >= 0.5 else "безопасен"
+    output_box.insert(tk.END, f"Тест URL: {url}\n  Признаки: {feats}\n  Предсказание (prob): {pred:.4f} -> {label}\n\n")
+
+# ----------------------------
+# Интерфейс Tkinter
+# ----------------------------
+root = tk.Tk()
+root.title("GA — Инициализация, Оценка и Обучение (supervised)")
+root.geometry("920x820")
+root.resizable(True, True)
+
+title_label = ttk.Label(root, text="Этап 1: Инициализация популяции — Этап 2: Оценка/Обучение (supervised)", font=("Arial", 13, "bold"))
+title_label.pack(pady=8)
+
+# URL / тест
+url_frame = ttk.Frame(root)
+url_frame.pack(pady=6, fill="x", padx=10)
+ttk.Label(url_frame, text="URL (тест):", font=("Arial", 11)).pack(side=tk.LEFT, padx=5)
+url_entry = ttk.Entry(url_frame, width=80)
+url_entry.pack(side=tk.LEFT, padx=5)
+ttk.Button(url_frame, text="Тест на лучшем", command=test_single_url_with_best).pack(side=tk.LEFT, padx=6)
+
+# Популяция
+pop_frame = ttk.Frame(root)
+pop_frame.pack(pady=6, fill="x", padx=10)
+ttk.Label(pop_frame, text="Размер популяции:", font=("Arial", 11)).pack(side=tk.LEFT, padx=5)
+pop_entry = ttk.Entry(pop_frame, width=8)
+pop_entry.pack(side=tk.LEFT)
+pop_entry.insert(0, "20")
+
+# suspicious file
+susp_frame = ttk.Frame(root)
+susp_frame.pack(pady=6, fill="x", padx=10)
+ttk.Label(susp_frame, text="Файл слов/весов (JSON):", font=("Arial", 11)).pack(side=tk.LEFT, padx=5)
+suspicious_entry = ttk.Entry(susp_frame, width=45)
+suspicious_entry.pack(side=tk.LEFT, padx=5)
+suspicious_entry.insert(0, DEFAULT_SUSPICIOUS_FILE)
+ttk.Button(susp_frame, text="Обзор...", command=browse_suspicious_file).pack(side=tk.LEFT, padx=5)
+
+# dataset controls
+data_frame = ttk.Frame(root)
+data_frame.pack(pady=6, fill="x", padx=10)
+ttk.Button(data_frame, text="Загрузить базу (CSV/JSON)", command=load_dataset_action).pack(side=tk.LEFT, padx=6)
+dataset_info_label = ttk.Label(data_frame, text="Файл", font=("Arial", 9))
+dataset_info_label.pack(side=tk.LEFT, padx=6)
+
+# training params
+train_frame = ttk.Frame(root)
+train_frame.pack(pady=6, fill="x", padx=10)
+ttk.Label(train_frame, text="Эпох:", font=("Arial", 10)).pack(side=tk.LEFT, padx=4)
+epochs_entry = ttk.Entry(train_frame, width=6)
+epochs_entry.insert(0, "5")
+epochs_entry.pack(side=tk.LEFT)
+ttk.Label(train_frame, text="Скорость обучения:", font=("Arial", 10)).pack(side=tk.LEFT, padx=4)
+lr_entry = ttk.Entry(train_frame, width=8)
+lr_entry.insert(0, "0.05")
+lr_entry.pack(side=tk.LEFT)
+ttk.Label(train_frame, text="Пакеты:", font=("Arial", 10)).pack(side=tk.LEFT, padx=4)
+batch_entry = ttk.Entry(train_frame, width=6)
+batch_entry.insert(0, "16")
+batch_entry.pack(side=tk.LEFT)
+
+# buttons
+btn_frame = ttk.Frame(root)
+btn_frame.pack(pady=8)
+ttk.Button(btn_frame, text="Создать популяцию", command=create_population_action).pack(side=tk.LEFT, padx=6)
+ttk.Button(btn_frame, text="Обучить популяцию (на загруженной базе)", command=train_population_action).pack(side=tk.LEFT, padx=6)
+
+# output box
+output_box = scrolledtext.ScrolledText(root, width=110, height=30, font=("Consolas", 10))
+output_box.pack(padx=10, pady=10, fill="both", expand=True)
+
+# старт
+root.mainloop()
